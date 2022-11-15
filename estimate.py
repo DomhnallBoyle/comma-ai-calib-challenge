@@ -1,10 +1,12 @@
 import argparse
 import random
 import time
+from pathlib import Path
 from threading import Thread
 
 import cv2
 import numpy as np
+from frechetdist import frdist
 
 FOCAL_LENGTH = 910
 
@@ -94,6 +96,20 @@ def pitch_yaw_to_vp(pitch, yaw, k):
     return np.round(k.dot(np.array([vp_cam_x, vp_cam_y, 1]))[:2]).astype(int)
 
 
+def vp_to_pitch_yaw(vp, k_inv): 
+    input_shape = vp.shape
+    vp = np.atleast_2d(vp)
+    vp = np.hstack((vp, np.ones((vp.shape[0], 1))))
+    cam_pts = vp.dot(k_inv.T)
+    cam_pts[(vp < 0).any(axis=1)] = np.nan
+    cam_pts = cam_pts[:, :2].reshape(input_shape)
+
+    yaw_calib = np.arctan(cam_pts[0])
+    pitch_calib = np.arctan(-cam_pts[1]) * np.cos(yaw_calib)
+
+    return pitch_calib, yaw_calib
+
+
 def angle_between_vectors(v1, v2):
     v1, v2 = point_diff(*v1), point_diff(*v2)
     v1_norm, v2_norm = vector_norm(v1), vector_norm(v2)
@@ -101,51 +117,6 @@ def angle_between_vectors(v1, v2):
     angle_rad = np.arccos(np.dot(v1 / v1_norm, v2 / v2_norm))
 
     return angle_rad * 180 / np.pi
-
-
-def get_intersection(v1, v2):
-    # https://stackoverflow.com/a/19550879
-    p0, p1 = v1
-    p2, p3 = v2
-
-    s10_x = p1[0] - p0[0]
-    s10_y = p1[1] - p0[1]
-    s32_x = p3[0] - p2[0]
-    s32_y = p3[1] - p2[1]
-
-    denom = s10_x * s32_y - s32_x * s10_y
-
-    if denom == 0 : return None # collinear
-
-    denom_is_positive = denom > 0
-
-    s02_x = p0[0] - p2[0]
-    s02_y = p0[1] - p2[1]
-
-    s_numer = s10_x * s02_y - s10_y * s02_x
-
-    if (s_numer < 0) == denom_is_positive : return None # no collision
-
-    t_numer = s32_x * s02_y - s32_y * s02_x
-
-    if (t_numer < 0) == denom_is_positive : return None # no collision
-
-    if (s_numer > denom) == denom_is_positive or (t_numer > denom) == denom_is_positive : return None # no collision
-
-    # collision detected
-
-    t = t_numer / denom
-
-    intersection_point = [ int(p0[0] + (t * s10_x)), int(p0[1] + (t * s10_y)) ]
-
-    return intersection_point
-
-
-def get_slope(p1, p2):
-    x1, y1 = p1
-    x2, y2 = p2
-
-    return (y2 - y1) / (x2 - x1)
 
 
 def line_intersection(line1, line2):
@@ -163,37 +134,51 @@ def line_intersection(line1, line2):
     x = det(d, xdiff) / div
     y = det(d, ydiff) / div
 
-    return x, y
+    return np.array((x, y)).astype(int)
 
 
-def ransac_vp(motion_vectors):
-    """
-    - get initial VP from intersection of random 2 motion vectors
-    - for each motion vector (call this v):
-        - create vector from base point of v to VP (call this u)
-        - get angle between v and u
-        - if inlier vector (i.e. < 45), calculate score using exponential function. If outlier, score = 0
-        - smaller angles = higher score because of exponential function
-        - NOT SURE: repeat with a different VP calculated by random 2 motion vectors of INLIERS ONLY (i.e. forget about outliers)???
-    - NOT SURE: end when only 1 inlier left? use VP
-    """
-    if not motion_vectors: 
-        return
+def ransac_vp(motion_vectors, max_inlier_angle, max_best_score_attempts):
+    best_vp, best_vp_score = None, -np.inf
+    attempts_since_improvement = 0
+    while attempts_since_improvement < max_best_score_attempts:
+        
+        if len(motion_vectors) < 2: 
+            return
 
-    # get random VP as initial VP
-    while True:
-        v1, v2 = random.sample(motion_vectors, 2)
-        try:
-            vp = line_intersection(v1, v2)
-        except Exception:
-            continue
+        # get random VP as initial VP i.e. hypothesis
+        num_vp_attempts = 10
+        while True:
+            v1, v2 = random.sample(motion_vectors, 2)
+            try:
+                vp = line_intersection(v1, v2)
+            except Exception:
+                num_vp_attempts -= 1
+                if num_vp_attempts == 0: 
+                    return
+                continue
 
-        break
+            break
 
-    for v in motion_vectors:
-        pass
+        vp_score = 0
+        for v in motion_vectors:
+            # create vector from base point to VP
+            head, base = v
+            u = [head, vp]
 
-    return 1, 1
+            theta = angle_between_vectors(v, u)
+
+            # exponential score - vector with smaller angle contributes more to the voting
+            score = np.exp(-abs(theta)) if theta < max_inlier_angle else 0
+            vp_score += score
+
+        if vp_score > best_vp_score:
+            best_vp_score = vp_score
+            best_vp = vp
+            attempts_since_improvement = 0
+        else:
+            attempts_since_improvement += 1  # no improvement
+
+    return best_vp
 
 
 class VideoBuffer:
@@ -235,21 +220,73 @@ class VideoBuffer:
         t.start()
 
 
+class MVClustering:
+    
+    def __init__(self, num_clusters, frame_width, frame_height, max_iterations=100):
+        self.num_clusters = num_clusters
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.max_iterations = max_iterations
+        self.random_point = lambda: np.array([random.randint(0, self.frame_width), random.randint(0, self.frame_height)])
+        self.initialise_centroids()
+
+    def initialise_centroids(self):
+        # centroids are lines
+        self.centroids = [[self.random_point(), self.random_point()] for _ in range(self.num_clusters)]
+
+    def run(self, motion_vectors):
+        # TODO: stop when centroids don't change
+        while self.max_iterations > 0: 
+            clusters = {i: [] for i in range(self.num_clusters)}
+
+            # calculate distance of all mvs to all centroids
+            # assign mv to closest centroid
+            for v in motion_vectors:
+                best_distance, closest_centroid = np.inf, None
+                for j, centroid in enumerate(self.centroids): 
+                    distance = frdist(v, centroid)
+                    if distance < best_distance: 
+                        best_distance = distance
+                        closest_centroid = j
+                clusters[closest_centroid].append(v)
+
+            # calculate new centroids - average of assigned motion vectors
+            new_centroids = []
+            for i, vectors in clusters.items():
+                average_p1, average_p2 = [0, 0], [0, 0]
+                for p1, p2 in vectors: 
+                    average_p1 = np.add(average_p1, p1)
+                    average_p2 = np.add(average_p2, p2)
+                new_centroid = [
+                    np.divide(average_p1, len(vectors)), 
+                    np.divide(average_p2, len(vectors))
+                ]
+                new_centroids.append(new_centroid)
+            self.centroids = new_centroids
+            
+            self.max_iterations -= 1
+        
+        final_centroids = []
+        for v in self.centroids: 
+            if np.isnan(v).any():
+                continue
+            v = [v[0].astype(int), v[1].astype(int)]
+            final_centroids.append(v)
+
+        return final_centroids
+
+
 def main(args): 
-    # TODO: 
-    #  investigate get_intersection from cnn
-    #  ransac method
-    #  ignore bottom percentage of frame
-    #  return median pitch and yaw if can't find new pitch and yaw
-    #  cluster lines that are close
+    # TODO: ignore bottom percentage of frame
 
-    video_path = f'labelled/{args.video}.hevc'
-    gt_path = f'labelled/{args.video}.txt'
+    video_path = Path(f'{args.video_directory}/{args.video_id}.hevc')
+    gt_path = Path(f'{args.video_directory}/{args.video_id}.txt')
+    assert video_path.exists()
 
-    video_buffer = VideoBuffer(video_path=video_path, early_stop=args.early_stop)
+    video_buffer = VideoBuffer(video_path=str(video_path), early_stop=args.early_stop)
     video_buffer.start()
 
-    euler_angles = get_euler_angles(gt_path=gt_path)
+    euler_angles = get_euler_angles(gt_path=gt_path) if gt_path.exists() else None
 
     t, k = 0, 1
     p_t0 = None
@@ -264,12 +301,13 @@ def main(args):
         [0.0, FOCAL_LENGTH, height / 2],
         [0.0, 0.0, 1.0]
     ])
+    camera_intrinsics_inv  = np.linalg.inv(camera_intrinsics)
     line_boundaries = [
         [(0, 0), (width, 0)],
         [(0, height), (width, height)],
         [(0, 0), (0, height)],
         [(width, 0), (width, height)]
-    ]
+    ]  # line boundaries of the frame
 
     while True:
         success, video_frame = video_buffer[t]
@@ -345,18 +383,33 @@ def main(args):
         num_vectors_after_type_3_filtering = len(motion_vectors[t + k])
 
         if args.debug: 
-            print(f'Filtering: None ({num_vectors_before_filtering}), Type 2 ({num_vectors_after_type_2_filtering}), Type 3 ({num_vectors_after_type_3_filtering})')
+            print(f'Filtering: Total ({num_vectors_before_filtering}), Type 2 ({num_vectors_after_type_2_filtering}), Type 3 ({num_vectors_after_type_3_filtering})')
             
         k += 1
         detect_corner_points = False
 
+    # # cluster the motion vectors of every frame
+    # clustering = MVClustering(
+    #     num_clusters=10, 
+    #     frame_width=width,
+    #     frame_height=height
+    # )
+    # new_motion_vectors = {}
+    # for i, _motion_vectors in motion_vectors.items():
+    #     _motion_vectors = clustering.run(motion_vectors=_motion_vectors)
+    #     new_motion_vectors[i] = _motion_vectors
+    #     clustering.initialise_centroids()
+    # motion_vectors = new_motion_vectors
+
+    pitches, yaws = [], []
+    num_rolling_frames = 10
     for i, motion_vectors in motion_vectors.items():
         video_frame = video_buffer[i][1]
 
-        # draw motion vectors
+        # extending the motion vectors to the boundaries of the frame i.e. get intersection points with boundaries
         new_motion_vectors = []
         for j, v in enumerate(motion_vectors):
-            new_v = []
+            new_v = []            
             for line in line_boundaries:
                 try:
                     x_int, y_int = line_intersection(v, line)
@@ -364,34 +417,62 @@ def main(args):
                     continue
 
                 if 0 <= x_int <= width and 0 <= y_int <= height:
-                    new_v.append((int(x_int), int(y_int)))
+                    new_v.append(np.array([x_int, y_int]).astype(int))
 
             if len(new_v) == 2:
                 new_motion_vectors.append(new_v)
 
+                # draw first and last motion vectors
                 if args.debug and j in [0, len(motion_vectors) - 1]:
                     cv2.line(video_frame, tuple(new_v[0]), tuple(new_v[1]), (255, 255, 255), thickness=2)
                     cv2.line(video_frame, tuple(v[0]), tuple(v[1]), (0, 0, 255), thickness=2)
         motion_vectors = new_motion_vectors
 
-        estimated_vp = ransac_vp(motion_vectors=motion_vectors)
+        # estimate the VP using a RANSAC method
+        estimated_vp = ransac_vp(
+            motion_vectors=motion_vectors, 
+            max_inlier_angle=args.max_inlier_angle, 
+            max_best_score_attempts=args.max_best_score_attempts
+        )
+
+        if estimated_vp is not None:
+            pitch, yaw = vp_to_pitch_yaw(estimated_vp, k_inv=camera_intrinsics_inv)
+            if not np.isnan(pitch) and not np.isnan(yaw):
+                pitches.append(pitch)
+                yaws.append(yaw)
+
+        # rolling average pitch and yaw
+        start = 0
+        if len(pitches) > num_rolling_frames:
+            start = len(pitches) - num_rolling_frames
+        pitch, yaw = np.mean(pitches[start:]), np.mean(yaws[start:])
+
+        estimated_vp = pitch_yaw_to_vp(pitch, yaw, k=camera_intrinsics)
 
         # draw gt VP, estimated VP and frame centre
         if args.debug:
-            vp = pitch_yaw_to_vp(*euler_angles[i], k=camera_intrinsics)
-            for point, colour in zip([vp, centre_point, estimated_vp],
-                                     [(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
+            points = [centre_point, estimated_vp]
+            if euler_angles is not None:
+                gt_vp = pitch_yaw_to_vp(*euler_angles[i], k=camera_intrinsics)
+                points.append(gt_vp)
+
+            for point, colour in zip(points, [(255, 0, 0), (0, 255, 0), (0, 0, 255)]):
                 cv2.circle(video_frame, tuple(point), 5, colour, -1)
 
             cv2.imshow('Video', video_frame)
             cv2.waitKey(args.fps)
+    
+        print(pitch, yaw)
+
+    print(pitch, yaw)  # last frame
 
     cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=int, default=0)
+    parser.add_argument('video_directory')
+    parser.add_argument('video_id', type=int)
     parser.add_argument('--early_stop', type=int)
     parser.add_argument('--num_corner_points', type=int, default=500)
     parser.add_argument('--corner_quality_level', type=float, default=0.01)
@@ -401,6 +482,7 @@ if __name__ == '__main__':
     parser.add_argument('--min_horizon_angle', type=int, default=10)
     parser.add_argument('--min_vector_distance', type=int, default=25)
     parser.add_argument('--max_inlier_angle', type=int, default=45)
+    parser.add_argument('--max_best_score_attempts', type=int, default=50)
     parser.add_argument('--fps', type=int, default=25)
     parser.add_argument('--debug', action='store_true')
 

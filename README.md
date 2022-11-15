@@ -1,10 +1,34 @@
 comma.ai Calibration Challenge!
 ======
 
+Implementation
+------
+The code is based on the paper "***A Robust Road Vanishing Point Detection Adapted to the Real-World Driving Scenes***"
+
+Algorithm steps:
+1. Detect corner points
+2. Track the corner points onto the next frame using Optical Flow
+3. Create motion vectors from tracked points in subsequent frames
+4. Filter motion vectors (optional k-means clustering)
+5. Estimate the Vanishing Point using a RANSAC method on the motion vectors
+6. Estimate pitch and yaw from VP (rolling average)
+
 Usage
 ------
-```python estimate.py```
+```
+pip install -r requirements.txt
 
+# preview mode
+python estimate.py labelled 0 --debug
+
+# test mode
+python -W ignore estimate.py labelled 0 > labelled_test/0.txt
+...
+python eval.py labelled_test/
+```
+
+Challenge
+------
 Your goal is to predict the direction of travel (in camera frame) from provided dashcam video.
 
 - This repo provides 10 videos. Every video is 1min long and 20 fps.

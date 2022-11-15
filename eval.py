@@ -6,7 +6,7 @@ if len(sys.argv) > 1:
   TEST_DIR = sys.argv[1]
 else:
   raise RuntimeError('No test directory provided')
-GT_DIR = 'labeled/'
+GT_DIR = 'labelled/'
 
 def get_mse(gt, test):
   test = np.nan_to_num(test)
